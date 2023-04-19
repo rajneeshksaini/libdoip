@@ -1,17 +1,30 @@
 #include "DoIPClient_h.h"
 
+DoIPClient::DoIPClient(std::string &ecuAIPAddr): _ecuIPAddress(ecuAIPAddr) {
+  verbose = false;
+}
+
+DoIPClient::DoIPClient(std::string &ecuAIPAddr, bool verbose):
+  _ecuIPAddress(ecuAIPAddr), verbose(verbose) {}
+
+DoIPClient::~DoIPClient() {
+  if (_sockFd >= 0) closeTcpConnection();
+  if(_sockFd_udp >= 0) closeUdpConnection();
+}
+
+
 /*
  *Set up the connection between client and server
  */
 void DoIPClient::startTcpConnection() {
 
-    const char* ipAddr = "127.0.0.1";
+    const char* ipAddr = _ecuIPAddress.c_str();
     bool connectedFlag = false;
     _sockFd = socket(AF_INET,SOCK_STREAM,0);   
     
     if(_sockFd>=0)
     {
-        std::cout << "Client TCP-Socket created successfully" << std::endl;
+        if (verbose) std::cout << "Client TCP-Socket created successfully" << std::endl;
 
         _serverAddr.sin_family = AF_INET;
         _serverAddr.sin_port = htons(_serverPortNr);
@@ -23,10 +36,14 @@ void DoIPClient::startTcpConnection() {
             if(_connected!=-1)
             {
                 connectedFlag = true;
-                std::cout << "Connection to server established" << std::endl;
+                if (verbose) std::cout << "Connection to server established" << std::endl;
             }
         }  
     }   
+}
+
+bool DoIPClient::isConnected() const {
+  return _connected == 0;
 }
 
 void DoIPClient::startUdpConnection(){
@@ -86,8 +103,8 @@ const std::pair<int,unsigned char*>* DoIPClient::buildRoutingActivationRequest()
    rareq[7]=0x07;
    
    //Payload-Type specific message-content
-   rareq[8]=0x0E;  //Source Address
-   rareq[9]=0x00;
+   rareq[8]=sourceAddress[0];  //Source Address
+   rareq[9]=sourceAddress[1];
    rareq[10]=0x00; //Activation-Type
    rareq[11]=0x00; //Reserved ISO(default)
    rareq[12]=0x00;
@@ -103,23 +120,69 @@ const std::pair<int,unsigned char*>* DoIPClient::buildRoutingActivationRequest()
 /*
  * Send the builded request over the tcp-connection to server
  */
-void DoIPClient::sendRoutingActivationRequest() {
+ssize_t DoIPClient::sendRoutingActivationRequest() {
         
-    const std::pair <int,unsigned char*>* rareqWithLength=buildRoutingActivationRequest();
-    write(_sockFd,rareqWithLength->second,rareqWithLength->first);    
+  const std::pair <int,unsigned char*>* rareqWithLength=buildRoutingActivationRequest();
+  return  write(_sockFd,rareqWithLength->second,rareqWithLength->first);    
+}
+
+/*
+ * receiveRoutingActivationResponse
+ *
+ * receives response for success/failure.
+ */
+bool DoIPClient::receiveRoutingActivationResponse() {
+  struct DoIPRequestActivationResponse response;
+  int readBytes = recv(_sockFd, (void *)&response, sizeof(struct DoIPRequestActivationResponse), 0);
+  if (readBytes <= 0) {
+    std::cout << "Error receing Routing Activation Response..." << std::endl;
+    return false;
+  }
+
+  std::cout << "Received " << readBytes << " as response to Routing Activation" << std::endl;
+  std::cout << "response code: " << std::hex << response.activation_response_code << std::endl;
+  return response.activation_response_code == ROUTING_ACTIVATION_SUCCESS;
+}
+
+/*
+ * requestRoutingActivation
+ *
+ * requests routing activation for a given address.
+*/
+bool DoIPClient::requestRoutingActivation(uint16_t address) {
+  if (!isConnected()) {
+    startTcpConnection();
+  }
+  if (!isConnected()) {
+    std::cout << "Unable to connect to the ECU at " << _ecuIPAddress << std::endl;
+    return false;
+  }
+  setSourceAddress(address);
+  if (sendRoutingActivationRequest() < 0) {
+    std::cout << "Unable to send routing activation request...error code: " << errno << std::endl;
+    return false;
+  }
+
+  // sent, wait for response
+  return receiveRoutingActivationResponse();
 }
 
 /**
  * Sends a diagnostic message to the server
+ * @param sourceAddress     source address of the ecu which should receive the message
  * @param targetAddress     the address of the ecu which should receive the message
  * @param userData          data that will be given to the ecu
  * @param userDataLength    length of userData
  */
-void DoIPClient::sendDiagnosticMessage(unsigned char* targetAddress, unsigned char* userData, int userDataLength) {
-    unsigned short sourceAddress = 0x0E00;
+ssize_t DoIPClient::sendDiagnosticMessage(uint16_t sourceAddress,
+      uint16_t _targetAddress, unsigned char* userData, int userDataLength) {
+    uint8_t targetAddress[2];
+    _targetAddress = htons(_targetAddress);
+    targetAddress[0] = _targetAddress & 0x00FF;
+    targetAddress[1] = (_targetAddress & 0xFF00 ) >> 8;
     unsigned char* message = createDiagnosticMessage(sourceAddress, targetAddress, userData, userDataLength);
 
-    write(_sockFd, message, _GenericHeaderLength + _DiagnosticMessageMinimumLength + userDataLength);
+    return write(_sockFd, message, _GenericHeaderLength + _DiagnosticMessageMinimumLength + userDataLength);
 }
 
 /**
@@ -136,9 +199,9 @@ void DoIPClient::sendAliveCheckResponse() {
 /*
  * Receive a message from server
  */
-void DoIPClient::receiveMessage() {
+ssize_t DoIPClient::receiveMessage(void *buffer, ssize_t size) {
     
-    int readedBytes = recv(_sockFd,_receivedData,_maxDataSize, 0);
+    int readedBytes = recv(_sockFd, buffer, size, 0);
     
     if(!readedBytes) //if server is disconnected from client; client gets empty messages
     {
@@ -150,28 +213,29 @@ void DoIPClient::receiveMessage() {
             emptyMessageCounter = 0;
             reconnectServer();
         }
-        return;
+        return readedBytes;
     }
 	
-    printf("Client received: ");
-    for(int i = 0; i < readedBytes; i++)
-    {
-        printf("0x%02X ", _receivedData[i]);
-    }    
-    printf("\n ");	
+    if (verbose) {
+      printf("Client received: ");
+      for(int i = 0; i < readedBytes; i++) {
+        printf("0x%02X ", ((uint8_t *)buffer)[i]);
+      }    
+      printf("\n ");	
+    }
     
-    GenericHeaderAction action = parseGenericHeader(_receivedData, readedBytes);
+    GenericHeaderAction action = parseGenericHeader((uint8_t *)buffer, readedBytes);
 
     if(action.type == PayloadType::DIAGNOSTICPOSITIVEACK || action.type == PayloadType::DIAGNOSTICNEGATIVEACK) {
         switch(action.type) {
             case PayloadType::DIAGNOSTICPOSITIVEACK: {
                 std::cout << "Client received diagnostic message positive ack with code: ";
-                printf("0x%02X ", _receivedData[12]);
+                printf("0x%02X ", ((uint8_t *)buffer)[12]);
                 break;
             }
             case PayloadType::DIAGNOSTICNEGATIVEACK: {
                 std::cout << "Client received diagnostic message negative ack with code: ";
-                printf("0x%02X ", _receivedData[12]);
+                printf("0x%02X ", ((uint8_t *)buffer)[12]);
                 break;
             }
             default: {
@@ -181,7 +245,7 @@ void DoIPClient::receiveMessage() {
         }
         std::cout << std::endl;
     }
- 
+  return readedBytes; 
 }
 
 void DoIPClient::receiveUdpMessage() {
@@ -258,6 +322,17 @@ void DoIPClient::sendVehicleIdentificationRequest(const char* address){
 void DoIPClient::setSourceAddress(unsigned char* address) {
     sourceAddress[0] = address[0];
     sourceAddress[1] = address[1];
+}
+
+/**
+ * Sets the source address for this client
+ * @param address   source address for the client
+ */
+void DoIPClient::setSourceAddress(uint16_t address) {
+  // network order
+  address = htons(address);
+  sourceAddress[0] = (uint8_t) address&0xff;
+  sourceAddress[1] = (uint8_t) (address&0xff00) >> 8;
 }
 
 /*
