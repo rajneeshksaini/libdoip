@@ -16,7 +16,7 @@ const int _serverPortNr=13400;
 const int _maxDataSize=64;
 
 #define ROUTING_ACTIVATION_SUCCESS (0x10)
-
+#define MAX_CONNECTION_RETRIES	(3)
 
 class DoIPClient{
     
@@ -44,6 +44,7 @@ public:
     DoIPClient();
     DoIPClient(std::string &);
     DoIPClient(std::string &, bool);
+    DoIPClient(std::string &, int);
     ~DoIPClient();
 
     bool isConnected() const;
@@ -70,15 +71,10 @@ private:
     
     int emptyMessageCounter = 0;
     bool verbose;
+    bool validateDiagnosticAction(uint8_t *, ssize_t length, PayloadType);
+    int retries = MAX_CONNECTION_RETRIES;
 };
 
-
-struct __attribute__ ((packed)) DoIPHeader {
-  uint8_t proto_version;
-  uint8_t inverse_version;
-  uint16_t type;
-  uint32_t length;
-};
 
 struct __attribute__ ((packed)) DoIPRequestActivationResponse {
   struct DoIPHeader header;

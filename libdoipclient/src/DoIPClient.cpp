@@ -2,10 +2,18 @@
 
 DoIPClient::DoIPClient(std::string &ecuAIPAddr): _ecuIPAddress(ecuAIPAddr) {
   verbose = false;
+  retries = MAX_CONNECTION_RETRIES;
 }
 
 DoIPClient::DoIPClient(std::string &ecuAIPAddr, bool verbose):
-  _ecuIPAddress(ecuAIPAddr), verbose(verbose) {}
+  _ecuIPAddress(ecuAIPAddr), verbose(verbose) {
+  retries = MAX_CONNECTION_RETRIES;
+}
+
+DoIPClient::DoIPClient(std::string &ecuAIPAddr, int retries):
+  _ecuIPAddress(ecuAIPAddr), retries(retries) {
+  verbose=false;
+}
 
 DoIPClient::~DoIPClient() {
   if (_sockFd >= 0) closeTcpConnection();
@@ -21,23 +29,22 @@ void DoIPClient::startTcpConnection() {
     const char* ipAddr = _ecuIPAddress.c_str();
     bool connectedFlag = false;
     _sockFd = socket(AF_INET,SOCK_STREAM,0);   
+    int num_tries = 0;
     
-    if(_sockFd>=0)
-    {
-        if (verbose) std::cout << "Client TCP-Socket created successfully" << std::endl;
-
+    if(_sockFd>=0) {
         _serverAddr.sin_family = AF_INET;
         _serverAddr.sin_port = htons(_serverPortNr);
         inet_aton(ipAddr,&(_serverAddr.sin_addr)); 
         
-        while(!connectedFlag)
-        {
+        while(!connectedFlag && num_tries < retries){
             _connected = connect(_sockFd,(struct sockaddr *) &_serverAddr,sizeof(_serverAddr));
-            if(_connected!=-1)
-            {
+            if(_connected!=-1) {
                 connectedFlag = true;
                 if (verbose) std::cout << "Connection to server established" << std::endl;
+            } else {
+                std::cerr << "Unable to connect to " << _ecuIPAddress << ", try: " << num_tries+1 << std::endl;
             }
+            num_tries++;
         }  
     }   
 }
@@ -135,12 +142,12 @@ bool DoIPClient::receiveRoutingActivationResponse() {
   struct DoIPRequestActivationResponse response;
   int readBytes = recv(_sockFd, (void *)&response, sizeof(struct DoIPRequestActivationResponse), 0);
   if (readBytes <= 0) {
-    std::cout << "Error receing Routing Activation Response..." << std::endl;
+    std::cerr << "Error receing Routing Activation Response..." << std::endl;
     return false;
   }
 
-  std::cout << "Received " << readBytes << " as response to Routing Activation" << std::endl;
-  std::cout << "response code: " << std::hex << response.activation_response_code << std::endl;
+  if (verbose)
+    std::cout << "Received routing activation response woith code 0x" << std::hex << (uint16_t)response.activation_response_code << std::endl;
   return response.activation_response_code == ROUTING_ACTIVATION_SUCCESS;
 }
 
@@ -154,12 +161,12 @@ bool DoIPClient::requestRoutingActivation(uint16_t address) {
     startTcpConnection();
   }
   if (!isConnected()) {
-    std::cout << "Unable to connect to the ECU at " << _ecuIPAddress << std::endl;
+    std::cerr << "Unable to connect to the ECU at " << _ecuIPAddress << std::endl;
     return false;
   }
   setSourceAddress(address);
   if (sendRoutingActivationRequest() < 0) {
-    std::cout << "Unable to send routing activation request...error code: " << errno << std::endl;
+    std::cerr << "Unable to send routing activation request...error code: " << errno << std::endl;
     return false;
   }
 
@@ -173,6 +180,9 @@ bool DoIPClient::requestRoutingActivation(uint16_t address) {
  * @param targetAddress     the address of the ecu which should receive the message
  * @param userData          data that will be given to the ecu
  * @param userDataLength    length of userData
+
+ * validates +ve ACK and returns +ve number.
+ * if +ve ACK is not received, returns -1
  */
 ssize_t DoIPClient::sendDiagnosticMessage(uint16_t sourceAddress,
       uint16_t _targetAddress, unsigned char* userData, int userDataLength) {
@@ -181,8 +191,25 @@ ssize_t DoIPClient::sendDiagnosticMessage(uint16_t sourceAddress,
     targetAddress[0] = _targetAddress & 0x00FF;
     targetAddress[1] = (_targetAddress & 0xFF00 ) >> 8;
     unsigned char* message = createDiagnosticMessage(sourceAddress, targetAddress, userData, userDataLength);
+    auto s = write(_sockFd, message, _GenericHeaderLength + _DiagnosticMessageMinimumLength + userDataLength);
+    if (s < 0) {
+      std::cerr << "Unable to send Diagnotic message, errorcode: " << errno << std::endl;
+      return s;
+    }
 
-    return write(_sockFd, message, _GenericHeaderLength + _DiagnosticMessageMinimumLength + userDataLength);
+    // receive ACK
+    s = receiveMessage((void *)_receivedData, _maxDataSize);
+    if (s < 0) {
+      std::cerr << "Diagnostic ACK not received.." << std::endl;
+      return s;
+    }
+    if (validateDiagnosticAction(_receivedData, s, PayloadType::DIAGNOSTICPOSITIVEACK)) {
+        if (verbose) std::cout << "Received +ve ACK to Diagnostic command" << std::endl;
+        return s;
+    } else {
+        std::cerr << "Did not receive +ve ACK to Diagnostic command" << std::endl;
+    }
+    return -1;
 }
 
 /**
@@ -223,9 +250,20 @@ ssize_t DoIPClient::receiveMessage(void *buffer, ssize_t size) {
       }    
       printf("\n ");	
     }
-    
-    GenericHeaderAction action = parseGenericHeader((uint8_t *)buffer, readedBytes);
+  return readedBytes;
+}
 
+
+/*
+ * validateDiagnosticAction
+ *
+ * Validates against diagnostic action.
+*/
+bool DoIPClient::validateDiagnosticAction(uint8_t *buffer, ssize_t length, PayloadType actionType) {
+    GenericHeaderAction action = parseGenericHeader((uint8_t *)buffer, length);
+    return actionType == action.type;
+
+#if 0
     if(action.type == PayloadType::DIAGNOSTICPOSITIVEACK || action.type == PayloadType::DIAGNOSTICNEGATIVEACK) {
         switch(action.type) {
             case PayloadType::DIAGNOSTICPOSITIVEACK: {
@@ -245,7 +283,7 @@ ssize_t DoIPClient::receiveMessage(void *buffer, ssize_t size) {
         }
         std::cout << std::endl;
     }
-  return readedBytes; 
+#endif
 }
 
 void DoIPClient::receiveUdpMessage() {
@@ -330,9 +368,8 @@ void DoIPClient::setSourceAddress(unsigned char* address) {
  */
 void DoIPClient::setSourceAddress(uint16_t address) {
   // network order
-  address = htons(address);
-  sourceAddress[0] = (uint8_t) address&0xff;
-  sourceAddress[1] = (uint8_t) (address&0xff00) >> 8;
+  sourceAddress[1] = (uint8_t) (address&0xff);
+  sourceAddress[0] = (uint8_t) ((address&0xff00) >> 8);
 }
 
 /*
